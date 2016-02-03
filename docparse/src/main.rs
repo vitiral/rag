@@ -41,68 +41,17 @@ pub struct CodeBlock <'a>{
 //     doc: &'static str,
 // }
 
-fn play_re() {
-    let re = Regex::new(r"(\d{4})-(\d{2})-(\d{2})").unwrap();
-    let text = "2012-03-14, 2013-01-01 and 2014-07-05";
-    for cap in re.captures_iter(text) {
-        println!("Month: {} Day: {} Year: {}",
-                cap.at(2).unwrap_or(""), cap.at(3).unwrap_or(""),
-                cap.at(1).unwrap_or(""));
-    }
-}
-
-/// increment chars until the comment is done. Assumes the char before
-/// was '/'
-fn ignore_comment(chars: &mut std::str::Chars) -> Result<(usize, char)> {
-    let c = match chars.next() {
-        Some(c) => c,
-        None => return Ok((0, 0 as char)),
-    };
-    let mut i: usize = 1;  // already used `next` once
-    match c {
-        '*' => {
-            // block comment, ignore until end of block
-            let mut last = 0 as char;
-            for c in chars {
-                i += 1;
-                if last == '*' && c == '/' {
-                    return Ok((i, c));
-                }
-                last = c;
-            } // TODO: no more characters... panic? (invalid comment)
-            Err(ParseError::InvalidComment)
-        },
-        '/' => {
-            // one of the regular comments, ignore until newline
-            for c in chars {
-                i += 1;
-                if c == '\n' {
-                    return Ok((i, c));
-                }
-            }
-            Ok((i, c))
-        },
-        _ => Ok((i, c)),
-    }
-}
-
 /// find the match for the next opening bracket
 fn find_match(text: &str, open: char, close: char) -> Result<usize> {
     let mut num_opens: usize = 1;
     let mut chars = text.chars();
     let mut i = 0;
     loop {
-        let mut c = match chars.next() {
+        let c = match chars.next() {
             Some(c) => c,
             None => return Err(ParseError::Empty),
         };
         i += 1;
-        if c == '/' {
-            // it might be a comment, if it is, ignore everything until the comment ends
-            let (plus, _c) = try!(ignore_comment(&mut chars));
-            i += plus;
-            c = _c;
-        }
         if c == open {
             num_opens += 1;
         } else if c == close {
@@ -119,15 +68,20 @@ fn test_find_match() {
     assert_eq!(find_match("12345}", '{', '}').unwrap(), 6);
     assert_eq!(find_match(&"  {12345}"[3..], '{', '}').unwrap(), 6);
     let comment = "//badcomment {\n}";
-    assert_eq!(find_match(comment, '{', '}').unwrap(), comment.len());
+    let white = whiteout_comments(comment).unwrap();
+    assert_eq!(find_match(&white, '{', '}').unwrap(), comment.len());
     let block = "/*comment{*/}";
-    assert_eq!(find_match(block, '{', '}').unwrap(), block.len());
+    let white = whiteout_comments(block).unwrap();
+    assert_eq!(find_match(&white, '{', '}').unwrap(), block.len());
 }
 
-fn parse_captured<'a>(text: &str,
-                  cap: &regex::Captures<'a>,
+/// parse the captured text into a CodeBlock
+fn parse_captured<'a>(text: &'a str,
+                  cap: &regex::Captures,
                   block_delim: (char, char)) -> Result<CodeBlock<'a>> {
     // we can use unwrap here because there is no possible way that the pattern doesn't exist
+    // in addition, we can use unicode slices because we know (from the regexp) that
+    // the char boundaries are always valid
     let kind = match cap.at(2).unwrap() {
         "fn"     => CodeTypes::Fn,
         "struct" => CodeTypes::Struct,
@@ -138,14 +92,16 @@ fn parse_captured<'a>(text: &str,
     };
     // pos starts at declaration and goes until closing brace
     let mut pos = cap.pos(0).unwrap();
+    let sigpos = pos.clone();
     pos.0 = cap.pos(2).unwrap().0;
     if block_delim.0 as u8 != 0 {
         pos.1 = pos.1 + find_match(&(text[pos.1..]), block_delim.0, block_delim.1).unwrap();
     }
     // get rid of the close in sig and trim it
-    let sig = cap.at(0).unwrap();
+    let namepos = cap.pos(4).unwrap();
+    let sig = &text[pos.0..sigpos.1];
     let sig = (&sig[0..sig.len() - 1]).trim();
-    let name = cap.at(4).unwrap();
+    let name = &text[namepos.0..namepos.1];
     Ok(CodeBlock {
         name: name,
         kind: kind,
@@ -154,13 +110,86 @@ fn parse_captured<'a>(text: &str,
     })
 }
 
+/// whiteout comments by inserting ' ' for each **byte** that a comment
+/// would have taken up before.
+/// This function intenionally preserves the size of the string
+/// so that text.len() == white.len()
+fn whiteout_comments(text: &str) -> Result<String> {
+    let mut white = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    'outer: loop {
+        match chars.next() {
+            Some('/') => {
+                // it could be a comment
+                match chars.next() {
+                    Some('*') => {
+                        // it is a block comment, whitespace until end of block
+                        for _ in 0..2 { white.push(' ') };
+                        let mut last = 0 as char;
+                        for c in chars.by_ref() {
+                            if c == '\n' {
+                                white.push(c);  // we preserve newlines
+                            } else {
+                                for _ in 0..c.len_utf8(){ white.push(' ') };
+                            }
+                            if last == '*' && c == '/' {
+                                break;
+                            }
+                            last = c;
+                        }
+                    },
+                    Some('/') => {
+                        // it is one of the line comments, whiteout until newline
+                        for _ in 0..2 { white.push(' ') };
+                        for c in chars.by_ref() {
+                            if c == '\n' {
+                                white.push(c);
+                                break;
+                            }
+                            else {
+                                for _ in 0..c.len_utf8(){ white.push(' ') };
+                            }
+                        }
+                    },
+                    Some(c) => {
+                        // any other character
+                        white.push('/');
+                        white.push(c);
+                    }
+                    None => {
+                        // file ended with '/'
+                        white.push('/');
+                        break 'outer;
+                    }
+                }
+            },
+            Some(c) => white.push(c),
+            None => break,
+        }
+    }
+    assert_eq!(text.len(), white.len());
+    Ok(white)
+}
+
+#[test]
+fn test_whiteout_comments() {
+    let input  = "something // with a comment\n";
+    let expect = "something                  \n";
+    assert_eq!(whiteout_comments(input).unwrap(), expect);
+
+    let input  = "something /*comment \n in*/ middle\n";
+    let expect = "something           \n      middle\n";
+    assert_eq!(whiteout_comments(input).unwrap(), expect);
+}
+
 /// parse the given block of text for all rust code signatures
 /// and their positions
 fn parse_blocks(text: &str) -> Result<Vec<CodeBlock>> {
+    let white = try!(whiteout_comments(text));
     // FIXME: this should be made a global variable somehow
     let mut out: Vec<CodeBlock> = vec!();
     let docpat = Regex::new(r"(^|\n)\s*?(fn|struct|enum|trait|mod)\s+(<.*>)?\s*(\w+).*?\{").unwrap();
-    for cap in docpat.captures_iter(text) {
+    for cap in docpat.captures_iter(&white) {
         out.push(try!(parse_captured(text, &cap, ('{', '}'))));
     }
     let tuplepat = Regex::new(r"(^|\n)\s*?(struct)\s+(<.*>)?\s*(\w+).*?\(").unwrap();
@@ -274,7 +303,5 @@ fn myfun(x: i32, \
                 y:i64) -> u32 {
     ...
 }";
-    println!("my fun:\n{}", myfun);
-    play_re();
     println!("{:?}", parse_blocks(myfun));
 }
