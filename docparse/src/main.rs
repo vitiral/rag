@@ -5,7 +5,6 @@ use regex::Regex;
 #[derive(Debug)]
 enum ParseError {
     Empty,
-    InvalidComment,
 }
 
 type Result<T> = std::result::Result<T, ParseError>;
@@ -26,10 +25,10 @@ enum CodeTypes {
 /// one of the rust docmented types
 #[derive(Debug)]
 pub struct CodeBlock <'a>{
-    name: &'a str,
-    kind: CodeTypes,
-    sig: &'a str,
-    pos: (usize, usize),
+    name: &'a str,    // the name of the code block, i.e. `fn myfunc` has name "myfunc"
+    kind: CodeTypes,  // the type of the block, i.e. Fn, Struct, etc.
+    sig: &'a str,     // the sig, i.e. "fn myfunc(x: i32) -> i32"
+    pos: (usize, usize),  // the character positions of the block inside the file
 }
 
 // #[derive(Debug)]
@@ -76,9 +75,10 @@ fn test_find_match() {
 }
 
 /// parse the captured text into a CodeBlock
-fn parse_captured<'a>(text: &'a str,
-                  cap: &regex::Captures,
-                  block_delim: (char, char)) -> Result<CodeBlock<'a>> {
+fn parse_captured<'a>(text: &'a str,  // the unaltered text with a long lifetime
+                      white: &str,    // the whiteout-ed text for parsing
+                      cap: &regex::Captures,
+                      block_delim: (char, char)) -> Result<CodeBlock<'a>> {
     // we can use unwrap here because there is no possible way that the pattern doesn't exist
     // in addition, we can use unicode slices because we know (from the regexp) that
     // the char boundaries are always valid
@@ -90,14 +90,14 @@ fn parse_captured<'a>(text: &'a str,
         "mod"    => CodeTypes::Mod,
         _        => unreachable!(),
     };
-    // pos starts at declaration and goes until closing brace
     let mut pos = cap.pos(0).unwrap();
     let sigpos = pos.clone();
     pos.0 = cap.pos(2).unwrap().0;
     if block_delim.0 as u8 != 0 {
-        pos.1 = pos.1 + find_match(&(text[pos.1..]), block_delim.0, block_delim.1).unwrap();
+        pos.1 = pos.1 + find_match(&(white[pos.1..]), block_delim.0, block_delim.1).unwrap();
     }
-    // get rid of the close in sig and trim it
+    // convert from the regexp in white to actual text in text
+    // also gives us a longer lifetime
     let namepos = cap.pos(4).unwrap();
     let sig = &text[pos.0..sigpos.1];
     let sig = (&sig[0..sig.len() - 1]).trim();
@@ -182,23 +182,34 @@ fn test_whiteout_comments() {
     assert_eq!(whiteout_comments(input).unwrap(), expect);
 }
 
+
+/// get a regular expression for searching for the specified block
+fn block_regex(kind: &str, open: &str) -> std::result::Result<Regex, regex::Error> {
+    // must start at a newline and can have some whitespace before it
+    let pat = format!(r"(^|\n)\s*?({})\s+(<.*>)?\s*(\w+).*?{}",
+                      kind, open);
+    Regex::new(&pat)
+}
+
 /// parse the given block of text for all rust code signatures
 /// and their positions
 fn parse_blocks(text: &str) -> Result<Vec<CodeBlock>> {
+    // FIXME: the compiled regexps need to be made into global variables
     let white = try!(whiteout_comments(text));
-    // FIXME: this should be made a global variable somehow
+    // println!(">>>>>> WHITE\n{}>>>>>", white);
     let mut out: Vec<CodeBlock> = vec!();
-    let docpat = Regex::new(r"(^|\n)\s*?(fn|struct|enum|trait|mod)\s+(<.*>)?\s*(\w+).*?\{").unwrap();
+    let docpat = block_regex("fn|struct|enum|trait|mod", r"\{").unwrap();
     for cap in docpat.captures_iter(&white) {
-        out.push(try!(parse_captured(text, &cap, ('{', '}'))));
+        let v = try!(parse_captured(text, &white, &cap, ('{', '}')));
+        out.push(v);
     }
-    let tuplepat = Regex::new(r"(^|\n)\s*?(struct)\s+(<.*>)?\s*(\w+).*?\(").unwrap();
-    for cap in tuplepat.captures_iter(text) {
-        out.push(try!(parse_captured(text, &cap, ('(', ')'))));
+    let tuplepat = block_regex("struct", r"\(").unwrap();
+    for cap in tuplepat.captures_iter(&white) {
+        out.push(try!(parse_captured(text, &white, &cap, ('(', ')'))));
     }
-    let nullpat = Regex::new(r"(^|\n)\s*?(struct)\s+(<.*>)?\s*(\w+).*?\(").unwrap();
-    for cap in nullpat.captures_iter(text) {
-        out.push(try!(parse_captured(text, &cap, (0 as char, 0 as char))));
+    let nullpat = block_regex("struct", ";").unwrap();
+    for cap in nullpat.captures_iter(&white) {
+        out.push(try!(parse_captured(text, &white, &cap, (0 as char, 0 as char))));
     }
     // sort by start position
     out.sort_by(|a, b| a.pos.0.cmp(&b.pos.0));
@@ -213,7 +224,11 @@ static TEST_TEXT: &'static str = "
 /// some more docs
 fn myfun(x: i32, y:i64) -> u32 {
     // here are some comments inside the function
-    ...
+    let x = 4;
+    if x == 7 {
+        println!(\"what the heck is happening?\");
+    }
+    {{{}}} // just to cause problems
     // end myfun
 }
 
@@ -240,27 +255,34 @@ struct tuplestruct(u32, f64
 )
 
 /// documentation for nullstruct
-struct nullstruct /*some terrible documentation;*/ /*end of nullstruct*/;
+struct nullstruct /*some terrible documentation;*/ /*end nullstruct*/ ;
 
 /// documentation for mymod
 /// some more mod documentation
 mod mymod {
     fn myfun2(x: i32, y: f64) -> f64 {
         // here are some comments inside myfun
-        ...
+        if x == 7 {
+            println!(\"what the heck is x\");
+        }
+        // a comment
         /* terrible block comment }*/
+        // terrible } line comment
         // end myfun2
     }
+    // some more comments
     // end mymod
 }
 
 some stuff after mod
+
 ";
 
 #[test]
 fn test_parse_blocks() {
-    let mut n = 0;
     let blocks = parse_blocks(TEST_TEXT).unwrap();
+    let mut n = 0;
+
     let block = &blocks[n];
     assert_eq!(block.name, "myfun");
     match block.kind {
@@ -282,16 +304,51 @@ fn test_parse_blocks() {
     assert!(&TEST_TEXT[block.pos.0..].starts_with("enum myenum"));
     assert!(&TEST_TEXT[..block.pos.1].ends_with(" // end myenum\n}"));
 
-    // n += 1;
-    // let block = &blocks[n];
-    // assert_eq!(block.name, "mystruct");
-    // match block.kind {
-    //     CodeTypes::Enum => {},
-    //     _ => assert!(false),
-    // }
-    // assert_eq!(block.sig, "enum myenum");
-    // assert!(&TEST_TEXT[block.pos.0..].starts_with("enum myenum"));
-    // assert!(&TEST_TEXT[..block.pos.1].ends_with(" // end myenum\n}"));
+    n += 1;
+    let block = &blocks[n];
+    assert_eq!(block.name, "mystruct");
+    match block.kind {
+        CodeTypes::Struct => {},
+        _ => assert!(false),
+    }
+    assert_eq!(block.sig, "struct mystruct");
+    assert!(&TEST_TEXT[block.pos.0..].starts_with("struct mystruct"));
+    assert!(&TEST_TEXT[..block.pos.1].ends_with(" // end mystruct\n}"));
+
+    n += 1;
+    let block = &blocks[n];
+    assert_eq!(block.name, "tuplestruct");
+    match block.kind {
+        CodeTypes::Struct => {},
+        _ => assert!(false),
+    }
+    assert_eq!(block.sig, "struct tuplestruct");
+    assert!(&TEST_TEXT[block.pos.0..].starts_with("struct tuplestruct"));
+    assert!(&TEST_TEXT[..block.pos.1].ends_with(" // end tuplestruct\n)"));
+
+    n += 1;
+    let block = &blocks[n];
+    assert_eq!(block.name, "nullstruct");
+    match block.kind {
+        CodeTypes::Struct => {},
+        _ => assert!(false),
+    }
+    assert_eq!(block.sig, "struct nullstruct /*some terrible documentation;*/ /*end nullstruct*/");
+    assert!(&TEST_TEXT[block.pos.0..].starts_with("struct nullstruct"));
+    assert!(&TEST_TEXT[..block.pos.1].ends_with(" /*end nullstruct*/ ;"));
+
+    n += 1;
+    let block = &blocks[n];
+    assert_eq!(block.name, "mymod");
+    match block.kind {
+        CodeTypes::Mod => {},
+        _ => assert!(false),
+    }
+    assert_eq!(block.sig, "mod mymod");
+    assert!(&TEST_TEXT[block.pos.0..].starts_with("mod mymod"));
+    assert!(&TEST_TEXT[..block.pos.1].ends_with(" // end mymod\n}"));
+
+
 }
 
 
